@@ -158,6 +158,23 @@ async function extractCards(page) {
       return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
     };
 
+    // 轮播位与推荐位的容器特征。这类模块的商品不是“一排 N 个”的搜索网格商品，
+    // 混进来会把真实搜索顺位整体推后，因此一律排除在顺位之外。
+    const CAROUSEL_SELECTOR = [
+      ".a-carousel-card",
+      ".a-carousel-viewport",
+      "[data-a-carousel-options]",
+      ".a-carousel",
+    ].join(", ");
+
+    // 主搜索网格商品卡片。只有这类卡片参与页内位置与总位置编号。
+    const PRIMARY_GRID_SELECTOR = '[data-component-type="s-search-result"]';
+
+    const isPrimaryGridCard = (card) => {
+      if (card.closest(CAROUSEL_SELECTOR)) return false;
+      return Boolean(card.closest(PRIMARY_GRID_SELECTOR));
+    };
+
     const isSponsored = (card) => {
       const explicitSelectors = [
         '.s-sponsored-label-info-icon',
@@ -166,6 +183,11 @@ async function extractCards(page) {
         '[data-component-type="s-sponsored-label-marker"]',
         '[data-csa-c-ad-status]',
         '[data-ad-details]',
+        '[aria-label*="Sponsored" i]',
+        '[data-component-type="sp-sponsored-result"]',
+        '[data-csa-c-cs-type="ads"]',
+        '[class*="s-sponsored"]',
+        '[class*="AdHolder"]',
       ];
       for (const selector of explicitSelectors) {
         if (card.matches(selector) || card.closest(selector) || card.querySelector(selector)) {
@@ -205,6 +227,7 @@ async function extractCards(page) {
         if (cleanText(ancestor.getAttribute("data-asin")).toUpperCase() === asin) card = ancestor;
       }
       if (!isVisible(card) || seenCards.has(card)) continue;
+      if (!isPrimaryGridCard(card)) continue;
       seenCards.add(card);
       candidates.push({ card, asin, seedLink: null });
     }
@@ -223,6 +246,7 @@ async function extractCards(page) {
         link.closest('[data-csa-c-type="item"]') ||
         link.parentElement;
       if (!card || !isVisible(card) || seenCards.has(card)) continue;
+      if (!isPrimaryGridCard(card)) continue;
       seenCards.add(card);
       candidates.push({ card, asin, seedLink: link });
     }
