@@ -1,0 +1,8 @@
+.runtime/
+output/
+node_modules/
+__pycache__/
+*.pyc
+
+logs/
+.workbuddy-ai/
