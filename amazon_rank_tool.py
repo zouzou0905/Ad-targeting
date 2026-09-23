@@ -179,6 +179,28 @@ def occurrence_text(occurrences: list[dict[str, Any]]) -> str:
     )
 
 
+def module_occurrence_text(occurrences: list[dict[str, Any]]) -> str:
+    if not occurrences:
+        return "无"
+    parts = []
+    for item in occurrences:
+        cards_before = item.get("cardsBefore") or 0
+        where = f"第{cards_before}个搜索结果之后" if cards_before > 0 else "搜索结果最前"
+        parts.append(f"{item.get('kind', '广告模块')}（第{item['page']}页/{where}）")
+    return "，".join(parts)
+
+
+def target_status(target: dict[str, Any]) -> str:
+    parts = []
+    if target.get("adOccurrences"):
+        parts.append("广告位")
+    if target.get("organicOccurrences"):
+        parts.append("自然位")
+    if target.get("adModuleOccurrences"):
+        parts.append("网格外广告位")
+    return "+".join(parts) if parts else "未找到"
+
+
 def build_text_log(scan_payload: dict[str, Any]) -> str:
     lines = [
         "Amazon 关键词 ASIN 位置检测日志",
@@ -196,6 +218,7 @@ def build_text_log(scan_payload: dict[str, Any]) -> str:
             lines.append(
                 f"第 {summary['page']} 页：计入 {summary['productCards']} 个商品位置，"
                 f"广告 {summary['sponsoredCards']}，自然 {summary['organicCards']}；"
+                f"网格外广告模块 {summary.get('adModules', 0)} 个；"
                 f"标准结果 {summary.get('standardCards', '未知')}，"
                 f"可见唯一 ASIN {summary.get('uniqueDataAsins', '未知')}，"
                 f"商品链接唯一 ASIN {summary.get('uniqueProductLinkAsins', '未知')}，"
@@ -204,21 +227,23 @@ def build_text_log(scan_payload: dict[str, Any]) -> str:
         for target in result.get("targets", {}).values():
             ads = target.get("adOccurrences", [])
             organic = target.get("organicOccurrences", [])
-            status = "未找到"
-            if ads and organic:
-                status = "广告+自然"
-            elif ads:
-                status = "广告位"
-            elif organic:
-                status = "自然位"
+            modules = target.get("adModuleOccurrences", [])
             lines.append(
-                f"ASIN {target['asin']}｜{status}｜广告排名：{occurrence_text(ads)}｜"
+                f"ASIN {target['asin']}｜{target_status(target)}｜广告排名：{occurrence_text(ads)}｜"
                 f"自然排名：{occurrence_text(organic)}"
             )
+            if modules:
+                lines.append(f"网格外广告位：{module_occurrence_text(modules)}")
             occurrences = sorted(ads + organic, key=lambda item: item["overallPosition"])
-            if occurrences:
-                lines.append(f"标题：{occurrences[0].get('title') or '（未读取到标题）'}")
-                lines.append(f"链接：{occurrences[0].get('url') or '（未读取到链接）'}")
+            shown_title = (occurrences[0].get("title") if occurrences else "") or (
+                modules[0].get("title") if modules else ""
+            )
+            shown_url = (occurrences[0].get("url") if occurrences else "") or (
+                modules[0].get("url") if modules else ""
+            )
+            if shown_title or shown_url:
+                lines.append(f"标题：{shown_title or '（未读取到标题）'}")
+                lines.append(f"链接：{shown_url or '（未读取到链接）'}")
             if ads:
                 reasons = list(dict.fromkeys(item.get("sponsoredReason", "") for item in ads))
                 lines.append(f"广告识别依据：{'，'.join(reason for reason in reasons if reason)}")
@@ -238,7 +263,8 @@ def build_text_log(scan_payload: dict[str, Any]) -> str:
             lines.append(
                 f"关键词：{result['keyword']}｜ASIN：{target['asin']}｜"
                 f"广告排名：{occurrence_text(target.get('adOccurrences', []))}｜"
-                f"自然排名：{occurrence_text(target.get('organicOccurrences', []))}"
+                f"自然排名：{occurrence_text(target.get('organicOccurrences', []))}｜"
+                f"网格外广告位：{module_occurrence_text(target.get('adModuleOccurrences', []))}"
             )
     if found_count == 0:
         lines.append("本次扫描未发现有位置的关键词和 ASIN。")

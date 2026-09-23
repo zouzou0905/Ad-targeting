@@ -257,7 +257,7 @@ async function extractCards(page) {
       return position & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1;
     });
 
-    return candidates
+    const cards = candidates
       .map(({ card, asin, seedLink }, index) => {
         const sponsorship = isSponsored(card);
         const titleNode = card.querySelector("h2") || card.querySelector('[data-cy="title-recipe"]');
@@ -277,6 +277,95 @@ async function extractCards(page) {
         };
       })
       .filter((card) => /^[A-Z0-9]{10}$/.test(card.asin));
+
+    // ---------- 网格外广告模块 ----------
+    // 广告不一定落在搜索网格里。Amazon 会把广告做成独立模块插在网格之间或网格前后，
+    // 例如视频广告、精选商品广告、横幅广告、品牌广告，其商品卡片并不带
+    // data-component-type="s-search-result"。这些模块不参与搜索顺位编号
+    // （不计入页内位置与总位置），但必须单独记录，否则无法知道广告出现在哪里。
+    const AD_MODULE_MARKER_SELECTOR = [
+      '[aria-label^="Sponsored"]',
+      '[aria-label*="Sponsored" i]',
+      '[data-component-type="sp-sponsored-result"]',
+      '[class*="s-sponsored"]',
+      ".AdHolder",
+    ].join(", ");
+
+    const gridElements = candidates.map((candidate) => candidate.card);
+
+    const classifyAdModule = (element) => {
+      const widget = element.getAttribute("data-cel-widget") || "";
+      const className = String(element.className || "");
+      if (/VIDEO/i.test(widget) || element.querySelector("video, .sbv-desktop-video-link")) {
+        return "视频广告";
+      }
+      if (/FEATURED_ASINS/i.test(widget)) return "精选商品广告";
+      if (/loom-desktop|multi-brand|brand/i.test(widget)) return "品牌广告";
+      if (element.closest(CAROUSEL_SELECTOR)) return "轮播广告";
+      if (/^search_result_\d+$/.test(widget) && /s-flex-full-width/.test(className)) return "横幅广告";
+      if (/^search_result_\d+$/.test(widget)) return "网格间广告";
+      return "广告模块";
+    };
+
+    const collectAsins = (element) => {
+      const found = new Set();
+      const own = cleanText(element.getAttribute("data-asin")).toUpperCase();
+      if (validAsin(own)) found.add(own);
+      for (const node of element.querySelectorAll("[data-asin]")) {
+        const value = cleanText(node.getAttribute("data-asin")).toUpperCase();
+        if (validAsin(value)) found.add(value);
+      }
+      for (const link of element.querySelectorAll("a[href]")) {
+        const raw = `${link.getAttribute("href") || ""} ${link.href || ""}`.toUpperCase();
+        const match = raw.match(/\/(?:DP|GP\/PRODUCT)\/([A-Z0-9]{10})/);
+        if (match) found.add(match[1]);
+      }
+      return [...found];
+    };
+
+    const moduleRoots = new Set();
+    for (const marker of root.querySelectorAll(AD_MODULE_MARKER_SELECTOR)) {
+      const element =
+        marker.closest("[data-cel-widget]") ||
+        marker.closest(".s-widget-container") ||
+        marker.parentElement;
+      if (element && isVisible(element)) moduleRoots.add(element);
+    }
+
+    // 只保留最外层模块，避免内外嵌套导致同一块广告被重复记录。
+    const outermostRoots = [...moduleRoots].filter(
+      (element) => ![...moduleRoots].some((other) => other !== element && other.contains(element)),
+    );
+
+    const adModules = [];
+    for (const element of outermostRoots) {
+      // 网格卡片自身的广告由 isSponsored 标记；含网格卡片的容器不是纯广告模块。
+      if (element.closest(PRIMARY_GRID_SELECTOR)) continue;
+      if (element.querySelector(PRIMARY_GRID_SELECTOR)) continue;
+
+      const asins = collectAsins(element);
+      if (asins.length === 0) continue;
+
+      let cardsBefore = 0;
+      for (const gridElement of gridElements) {
+        if (gridElement.compareDocumentPosition(element) & Node.DOCUMENT_POSITION_FOLLOWING) {
+          cardsBefore += 1;
+        }
+      }
+
+      const titleNode = element.querySelector("h2, h3");
+      const linkNode = element.querySelector('a[href*="/dp/"]');
+      adModules.push({
+        asins,
+        kind: classifyAdModule(element),
+        moduleId: element.getAttribute("data-cel-widget") || "",
+        cardsBefore,
+        title: cleanText(titleNode?.innerText || titleNode?.textContent),
+        url: linkNode?.href || "",
+      });
+    }
+
+    return { cards, adModules };
   });
 }
 
@@ -286,6 +375,7 @@ function createTargetResult(asin) {
     found: false,
     adOccurrences: [],
     organicOccurrences: [],
+    adModuleOccurrences: [],
   };
 }
 
@@ -299,22 +389,43 @@ function positionsText(occurrences) {
     .join("，");
 }
 
+function moduleOccurrenceText(occurrences) {
+  if (!occurrences || occurrences.length === 0) return "无";
+  return occurrences
+    .map((item) => {
+      const where = item.cardsBefore > 0 ? `第${item.cardsBefore}个搜索结果之后` : "搜索结果最前";
+      return `${item.kind}（第${item.page}页/${where}）`;
+    })
+    .join("，");
+}
+
+function statusText(target) {
+  const parts = [];
+  if (target.adOccurrences.length) parts.push("广告位");
+  if (target.organicOccurrences.length) parts.push("自然位");
+  if ((target.adModuleOccurrences || []).length) parts.push("网格外广告位");
+  return parts.length ? parts.join("+") : "未找到";
+}
+
 function printTargetLogs(result) {
   for (const target of Object.values(result.targets)) {
     const adText = positionsText(target.adOccurrences);
     const organicText = positionsText(target.organicOccurrences);
-    let status = "未找到";
-    if (target.adOccurrences.length && target.organicOccurrences.length) status = "广告+自然";
-    else if (target.adOccurrences.length) status = "广告位";
-    else if (target.organicOccurrences.length) status = "自然位";
+    const moduleOccurrences = target.adModuleOccurrences || [];
+    const status = statusText(target);
 
     console.log(`  ASIN ${target.asin}｜${status}｜广告排名：${adText}｜自然排名：${organicText}`);
+    if (moduleOccurrences.length) {
+      console.log(`    网格外广告位：${moduleOccurrenceText(moduleOccurrences)}`);
+    }
     const occurrences = [...target.adOccurrences, ...target.organicOccurrences].sort(
       (left, right) => left.overallPosition - right.overallPosition,
     );
-    if (occurrences[0]) {
-      console.log(`    标题：${occurrences[0].title || "（未读取到标题）"}`);
-      console.log(`    链接：${occurrences[0].url || "（未读取到链接）"}`);
+    const shownTitle = occurrences[0]?.title || moduleOccurrences[0]?.title;
+    const shownUrl = occurrences[0]?.url || moduleOccurrences[0]?.url;
+    if (shownTitle || shownUrl) {
+      console.log(`    标题：${shownTitle || "（未读取到标题）"}`);
+      console.log(`    链接：${shownUrl || "（未读取到链接）"}`);
     }
     if (target.adOccurrences.length) {
       const reasons = [...new Set(target.adOccurrences.map((item) => item.sponsoredReason))];
@@ -333,7 +444,8 @@ function printFoundSummary(results) {
       console.log(
         `关键词：${result.keyword}｜ASIN：${target.asin}｜` +
           `广告排名：${positionsText(target.adOccurrences)}｜` +
-          `自然排名：${positionsText(target.organicOccurrences)}`,
+          `自然排名：${positionsText(target.organicOccurrences)}｜` +
+          `网格外广告位：${moduleOccurrenceText(target.adModuleOccurrences)}`,
       );
     }
   }
@@ -356,7 +468,7 @@ async function scanKeyword({ page, baseUrl, keyword, asins, rl }) {
     if (pageNumber > 1) searchUrl.searchParams.set("page", String(pageNumber));
 
     const loadMetrics = await loadSearchPage(page, searchUrl.toString(), rl);
-    const cards = await extractCards(page);
+    const { cards, adModules } = await extractCards(page);
     pagesScanned = pageNumber;
 
     if (cards.length === 0) {
@@ -371,6 +483,7 @@ async function scanKeyword({ page, baseUrl, keyword, asins, rl }) {
       productCards: cards.length,
       sponsoredCards: sponsoredCount,
       organicCards: cards.length - sponsoredCount,
+      adModules: adModules.length,
       standardCards: loadMetrics.standardCards,
       uniqueDataAsins: loadMetrics.uniqueDataAsins,
       uniqueProductLinkAsins: loadMetrics.uniqueProductLinkAsins,
@@ -379,6 +492,7 @@ async function scanKeyword({ page, baseUrl, keyword, asins, rl }) {
     console.log(
       `  第 ${pageNumber} 页：计入 ${cards.length} 个商品位置，` +
         `广告 ${sponsoredCount}，自然 ${cards.length - sponsoredCount}；` +
+        `网格外广告模块 ${adModules.length} 个；` +
         `标准结果 ${loadMetrics.standardCards}，可见唯一 ASIN ${loadMetrics.uniqueDataAsins}，` +
         `商品链接唯一 ASIN ${loadMetrics.uniqueProductLinkAsins}，` +
         `加载${loadMetrics.stabilized ? "已稳定" : "未完全稳定"}。`,
@@ -403,6 +517,23 @@ async function scanKeyword({ page, baseUrl, keyword, asins, rl }) {
       };
       if (card.sponsored) target.adOccurrences.push(occurrence);
       else target.organicOccurrences.push(occurrence);
+    }
+
+    // 网格外广告位：只记录“广告出现在哪里”，不参与上面的搜索顺位编号。
+    for (const module of adModules) {
+      for (const asin of module.asins) {
+        const target = targets[asin];
+        if (!target) continue;
+        target.found = true;
+        target.adModuleOccurrences.push({
+          page: pageNumber,
+          kind: module.kind,
+          moduleId: module.moduleId,
+          cardsBefore: module.cardsBefore,
+          title: module.title,
+          url: module.url,
+        });
+      }
     }
 
     // Always scan all three pages. The same ASIN can appear as an ad on one
